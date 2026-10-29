@@ -1,0 +1,19 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "admin:reset-password": "node reset-admin-password.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.9.1",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.2",
+    "multer": "^2.0.2",
+    "uuid": "^11.1.1",
+    "web-push": "^3.6.7"
+  }
+}
