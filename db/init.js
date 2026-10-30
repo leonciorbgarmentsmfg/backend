@@ -110,21 +110,6 @@ const initializeDatabase = db.transaction(() => {
       expires_at INTEGER NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS app_settings (
-      setting_key TEXT PRIMARY KEY,
-      setting_value TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS push_subscriptions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      endpoint TEXT NOT NULL UNIQUE,
-      p256dh TEXT NOT NULL,
-      auth TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-
     CREATE TABLE IF NOT EXISTS clients (
       client_id TEXT PRIMARY KEY,
       company_name TEXT NOT NULL UNIQUE,
@@ -150,10 +135,18 @@ const initializeDatabase = db.transaction(() => {
       sleeve_type TEXT NOT NULL,
       sleeve_length TEXT NOT NULL,
       fabric TEXT NOT NULL,
+      fabric_width TEXT NOT NULL DEFAULT '',
       gsm INTEGER NOT NULL,
+      order_priority TEXT NOT NULL DEFAULT 'Normal'
+        CHECK (order_priority IN ('Urgent', 'High', 'Normal')),
       item TEXT NOT NULL,
       total_quantity INTEGER NOT NULL DEFAULT 0,
       spreadsheet_path TEXT,
+      production_spreadsheet_path TEXT,
+      business_unit TEXT NOT NULL DEFAULT 'sublimation'
+        CHECK (business_unit IN ('dtf', 'sublimation')),
+      print_mode TEXT NOT NULL DEFAULT 'print_press'
+        CHECK (print_mode IN ('print_only', 'print_press')),
       mockup_path TEXT,
       swatch_path TEXT,
       sizing_notes TEXT NOT NULL DEFAULT '',
@@ -190,15 +183,26 @@ const initializeDatabase = db.transaction(() => {
       station TEXT NOT NULL,
       operator_id INTEGER NOT NULL REFERENCES users(id),
       fabric_used TEXT NOT NULL DEFAULT '',
+      printer_brand TEXT NOT NULL DEFAULT '',
       paper_meters REAL NOT NULL DEFAULT 0 CHECK (paper_meters >= 0),
       defect_description TEXT,
       reprint_job_id INTEGER REFERENCES reprint_jobs(id) ON DELETE SET NULL,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS production_log_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      station_log_id INTEGER NOT NULL REFERENCES station_logs(id) ON DELETE CASCADE,
+      consumable_code TEXT NOT NULL,
+      label TEXT NOT NULL,
+      quantity REAL NOT NULL CHECK (quantity > 0),
+      unit TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS fabric_inventory (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       fabric TEXT NOT NULL,
+      fabric_width TEXT NOT NULL DEFAULT '',
       gsm INTEGER NOT NULL CHECK (gsm > 0),
       roll_quantity INTEGER NOT NULL CHECK (roll_quantity > 0),
       measurement_type TEXT NOT NULL CHECK (measurement_type IN ('meter', 'kilo')),
@@ -269,7 +273,8 @@ const initializeDatabase = db.transaction(() => {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       category TEXT NOT NULL CHECK (category IN ('printing', 'pressing', 'cutting')),
       name TEXT NOT NULL,
-      UNIQUE (category, name)
+      business_unit TEXT CHECK (business_unit IN ('dtf', 'sublimation')),
+      UNIQUE (category, name, business_unit)
     );
 
     CREATE TABLE IF NOT EXISTS style_number_options (
@@ -329,6 +334,13 @@ const initializeDatabase = db.transaction(() => {
   if (orderColumns.length > 0 && !orderColumns.includes('swatch_path')) {
     db.exec('ALTER TABLE orders ADD COLUMN swatch_path TEXT');
   }
+  if (orderColumns.length > 0 && !orderColumns.includes('fabric_width')) {
+    db.exec("ALTER TABLE orders ADD COLUMN fabric_width TEXT NOT NULL DEFAULT ''");
+  }
+  if (orderColumns.length > 0 && !orderColumns.includes('order_priority')) {
+    db.exec(`ALTER TABLE orders ADD COLUMN order_priority TEXT NOT NULL DEFAULT 'Normal'
+      CHECK (order_priority IN ('Urgent', 'High', 'Normal'))`);
+  }
   if (orderColumns.length > 0 && !orderColumns.includes('sizing_notes')) {
     db.exec("ALTER TABLE orders ADD COLUMN sizing_notes TEXT NOT NULL DEFAULT ''");
   }
@@ -348,14 +360,23 @@ const initializeDatabase = db.transaction(() => {
   if (!stationLogColumns.includes('fabric_used')) {
     db.exec("ALTER TABLE station_logs ADD COLUMN fabric_used TEXT NOT NULL DEFAULT ''");
   }
+  if (!stationLogColumns.includes('printer_brand')) {
+    db.exec("ALTER TABLE station_logs ADD COLUMN printer_brand TEXT NOT NULL DEFAULT ''");
+  }
   if (!stationLogColumns.includes('reprint_job_id')) {
     db.exec('ALTER TABLE station_logs ADD COLUMN reprint_job_id INTEGER REFERENCES reprint_jobs(id) ON DELETE SET NULL');
   }
+  const fabricInventoryColumns = db
+    .prepare("PRAGMA table_info('fabric_inventory')")
+    .all()
+    .map((column) => column.name);
+  if (!fabricInventoryColumns.includes('fabric_width')) {
+    db.exec("ALTER TABLE fabric_inventory ADD COLUMN fabric_width TEXT NOT NULL DEFAULT ''");
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_fabric_inventory_catalog
+    ON fabric_inventory(fabric, fabric_width, gsm)`);
 
-  db.prepare("INSERT OR IGNORE INTO machines (category, name) VALUES ('printing', 'CREONS')").run();
-  db.prepare("INSERT OR IGNORE INTO machines (category, name) VALUES ('printing', 'Other')").run();
   db.prepare("INSERT OR IGNORE INTO machines (category, name) VALUES ('pressing', 'ES')").run();
-  db.prepare("INSERT OR IGNORE INTO machines (category, name) VALUES ('pressing', 'Other')").run();
   for (const order of db.prepare('SELECT DISTINCT cutting_machine FROM orders WHERE cutting_machine IS NOT NULL AND cutting_machine != \'\'').all()) {
     db.prepare("INSERT OR IGNORE INTO machines (category, name) VALUES ('cutting', ?)").run(order.cutting_machine);
   }
@@ -411,6 +432,105 @@ const initializeDatabase = db.transaction(() => {
 
 initializeDatabase.immediate();
 
+const machineColumns = db
+  .prepare("PRAGMA table_info('machines')")
+  .all()
+  .map((column) => column.name);
+if (machineColumns.length > 0 && !machineColumns.includes('business_unit')) {
+  db.exec("ALTER TABLE machines ADD COLUMN business_unit TEXT CHECK (business_unit IN ('dtf', 'sublimation'))");
+}
+const machinesSchema = db
+  .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'machines'")
+  .get()?.sql || '';
+if (!/UNIQUE\s*\(\s*category\s*,\s*name\s*,\s*business_unit\s*\)/i.test(machinesSchema)) {
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE machines_replacement (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category TEXT NOT NULL CHECK (category IN ('printing', 'pressing', 'cutting')),
+        name TEXT NOT NULL,
+        business_unit TEXT CHECK (business_unit IN ('dtf', 'sublimation')),
+        UNIQUE (category, name, business_unit)
+      );
+      INSERT INTO machines_replacement (id, category, name, business_unit)
+        SELECT id, category, name, business_unit FROM machines;
+      DROP TABLE machines;
+      ALTER TABLE machines_replacement RENAME TO machines;
+    `);
+  })();
+}
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_machines_category_name_unit
+  ON machines(category, name, ifnull(business_unit, ''));
+`);
+db.transaction(() => {
+  db.prepare(
+    `UPDATE machines SET business_unit = 'sublimation'
+     WHERE category = 'printing' AND business_unit IS NULL
+       AND upper(name) IN ('ATEXCO', 'CREONS')
+       AND NOT EXISTS (
+         SELECT 1 FROM machines assigned
+         WHERE assigned.category = machines.category
+           AND assigned.name = machines.name
+           AND assigned.business_unit = 'sublimation'
+       )`,
+  ).run();
+  db.prepare(
+    "DELETE FROM machines WHERE category = 'printing' AND business_unit IS NULL AND upper(name) IN ('ATEXCO', 'CREONS')",
+  ).run();
+  db.prepare(
+    "INSERT OR IGNORE INTO machines (category, name, business_unit) VALUES ('printing', 'CREONS', 'sublimation')",
+  ).run();
+})();
+db.prepare(
+  "INSERT OR IGNORE INTO machines (category, name, business_unit) VALUES ('printing', ?, 'dtf')",
+).run('Creons');
+db.prepare(
+  "INSERT OR IGNORE INTO machines (category, name, business_unit) VALUES ('printing', ?, 'dtf')",
+).run('Grando');
+db.transaction(() => {
+  for (const brand of ['CREONS', 'GRANDO']) {
+    const matches = db.prepare(
+      "SELECT id, name FROM machines WHERE category = 'printing' AND business_unit = 'dtf' AND upper(name) = ? ORDER BY (name = ?) DESC, id",
+    ).all(brand, brand);
+    if (matches.length > 0) {
+      const canonical = matches[0];
+      db.prepare(
+        "UPDATE orders SET printer_machine = ? WHERE business_unit = 'dtf' AND upper(printer_machine) = ?",
+      ).run(brand, brand);
+      if (canonical.name !== brand) {
+        db.prepare('UPDATE machines SET name = ? WHERE id = ?').run(brand, canonical.id);
+      }
+      for (const duplicate of matches.slice(1)) {
+        db.prepare('DELETE FROM machines WHERE id = ?').run(duplicate.id);
+      }
+    } else {
+      db.prepare(
+        "INSERT INTO machines (category, name, business_unit) VALUES ('printing', ?, 'dtf')",
+      ).run(brand);
+    }
+  }
+
+  db.prepare(
+    "DELETE FROM machines WHERE category = 'printing' AND business_unit = 'dtf' AND name NOT IN ('CREONS', 'GRANDO')",
+  ).run();
+  db.prepare("DELETE FROM machines WHERE lower(name) = 'other'").run();
+})()
+
+const initialOrderColumns = db
+  .prepare("PRAGMA table_info('orders')")
+  .all()
+  .map((column) => column.name);
+if (initialOrderColumns.length > 0 && !initialOrderColumns.includes('production_spreadsheet_path')) {
+  db.exec('ALTER TABLE orders ADD COLUMN production_spreadsheet_path TEXT');
+}
+if (initialOrderColumns.length > 0 && !initialOrderColumns.includes('business_unit')) {
+  db.exec("ALTER TABLE orders ADD COLUMN business_unit TEXT NOT NULL DEFAULT 'sublimation' CHECK (business_unit IN ('dtf', 'sublimation'))");
+}
+if (initialOrderColumns.length > 0 && !initialOrderColumns.includes('print_mode')) {
+  db.exec("ALTER TABLE orders ADD COLUMN print_mode TEXT NOT NULL DEFAULT 'print_press' CHECK (print_mode IN ('print_only', 'print_press'))");
+}
+
 const reprintJobColumns = db
   .prepare("PRAGMA table_info('reprint_jobs')")
   .all()
@@ -447,10 +567,18 @@ if (
           sleeve_type TEXT NOT NULL,
           sleeve_length TEXT NOT NULL,
           fabric TEXT NOT NULL,
+          fabric_width TEXT NOT NULL DEFAULT '',
           gsm INTEGER NOT NULL,
+          order_priority TEXT NOT NULL DEFAULT 'Normal'
+            CHECK (order_priority IN ('Urgent', 'High', 'Normal')),
           item TEXT NOT NULL,
           total_quantity INTEGER NOT NULL DEFAULT 0,
           spreadsheet_path TEXT,
+          production_spreadsheet_path TEXT,
+          business_unit TEXT NOT NULL DEFAULT 'sublimation'
+            CHECK (business_unit IN ('dtf', 'sublimation')),
+          print_mode TEXT NOT NULL DEFAULT 'print_press'
+            CHECK (print_mode IN ('print_only', 'print_press')),
           mockup_path TEXT,
           swatch_path TEXT,
           sizing_notes TEXT NOT NULL DEFAULT '',
@@ -473,7 +601,8 @@ if (
         INSERT INTO orders_stage_migration (
           order_id, client_id, sales_rep_id, team_project_name, order_date, due_date,
           style_number, category, style, cut, neck, sleeve_type, sleeve_length,
-          fabric, gsm, item, total_quantity, spreadsheet_path, mockup_path, swatch_path,
+          fabric, fabric_width, gsm, order_priority, item, total_quantity, spreadsheet_path,
+          production_spreadsheet_path, business_unit, print_mode, mockup_path, swatch_path,
           sizing_notes, other_details, layout_fee, layout_fee_paid, down_payment, assigned_artist_id,
           printer_machine, pressing_machine, cutting_machine, packed_quantity, per_piece_price,
           order_status, created_at, updated_at
@@ -481,7 +610,8 @@ if (
         SELECT
           order_id, client_id, sales_rep_id, team_project_name, order_date, due_date,
           style_number, category, style, cut, neck, sleeve_type, sleeve_length,
-          fabric, gsm, item, total_quantity, spreadsheet_path, mockup_path, swatch_path,
+          fabric, fabric_width, gsm, order_priority, item, total_quantity, spreadsheet_path,
+          production_spreadsheet_path, business_unit, print_mode, mockup_path, swatch_path,
           sizing_notes, other_details, layout_fee, 1, down_payment, assigned_artist_id,
           printer_machine, pressing_machine, cutting_machine, packed_quantity, per_piece_price,
           order_status, created_at, updated_at
@@ -646,3 +776,4 @@ export function verifyAdminCredentials(username, password) {
 }
 
 export default db;
+export { dbPath };

@@ -6,13 +6,13 @@ import { Readable } from 'node:stream';
 import express from 'express';
 import multer from 'multer';
 import ExcelJS from 'exceljs';
-import webPush from 'web-push';
+import Database from 'better-sqlite3';
 import { v4 as uuidv4 } from 'uuid';
-import db, { verifyAdminCredentials } from './db/init.js';
+import db, { dbPath, verifyAdminCredentials } from './db/init.js';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const HOST = process.env.HOST || '0.0.0.0';
+const HOST = process.env.HOST || (process.env.NODE_ENV === 'production' ? '127.0.0.1' : '0.0.0.0');
 if (process.env.TRUST_PROXY) {
   app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : process.env.TRUST_PROXY);
 }
@@ -20,76 +20,18 @@ const SESSION_COOKIE = 'bpsms_session';
 const SESSION_DURATION_MS = 8 * 60 * 60 * 1000;
 const PAID_LAYOUT_FEE_THRESHOLD = 1;
 const MINIMUM_LAYOUT_FEE = 700;
+const orderPriorities = ['Urgent', 'High', 'Normal'];
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const uploadDir = path.join(__dirname, 'uploads');
 const frontendDist = path.resolve(__dirname, '../frontend/dist');
-const notificationStageLabels = {
-  mockup: 'Artist mock-up',
-  sales_approval: 'Sales approval',
-  sizing: 'Artist sizing',
-  printing: 'Printing',
-  pressing: 'Pressing',
-  cutting: 'Cutting',
-  sewing: 'Sewing',
-  packing: 'Packing',
-  complete: 'Complete',
-  pickup_delivered: 'Pick-up / Delivered',
-};
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
 });
-const vapidPublicKeyFromEnv = process.env.VAPID_PUBLIC_KEY;
-const vapidPrivateKeyFromEnv = process.env.VAPID_PRIVATE_KEY;
-if (Boolean(vapidPublicKeyFromEnv) !== Boolean(vapidPrivateKeyFromEnv)) {
-  throw new Error('Set both VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY, or leave both unset');
-}
-let vapidKeys;
-if (vapidPublicKeyFromEnv) {
-  vapidKeys = {
-    publicKey: vapidPublicKeyFromEnv,
-    privateKey: vapidPrivateKeyFromEnv,
-  };
-} else {
-  const storedKeys = Object.fromEntries(
-    db.prepare(
-      "SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN ('vapid_public_key', 'vapid_private_key')",
-    ).all().map(({ setting_key, setting_value }) => [setting_key, setting_value]),
-  );
-  if (storedKeys.vapid_public_key && storedKeys.vapid_private_key) {
-    vapidKeys = {
-      publicKey: storedKeys.vapid_public_key,
-      privateKey: storedKeys.vapid_private_key,
-    };
-  } else {
-    vapidKeys = webPush.generateVAPIDKeys();
-    const saveKeys = db.transaction(() => {
-      db.prepare('INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES (?, ?)').run(
-        'vapid_public_key',
-        vapidKeys.publicKey,
-      );
-      db.prepare('INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES (?, ?)').run(
-        'vapid_private_key',
-        vapidKeys.privateKey,
-      );
-    });
-    saveKeys();
-    const persistedKeys = Object.fromEntries(
-      db.prepare(
-        "SELECT setting_key, setting_value FROM app_settings WHERE setting_key IN ('vapid_public_key', 'vapid_private_key')",
-      ).all().map(({ setting_key, setting_value }) => [setting_key, setting_value]),
-    );
-    vapidKeys = {
-      publicKey: persistedKeys.vapid_public_key,
-      privateKey: persistedKeys.vapid_private_key,
-    };
-  }
-}
-webPush.setVapidDetails(
-  process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
-  vapidKeys.publicKey,
-  vapidKeys.privateKey,
-);
+const databaseUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 },
+});
 const roleStations = {
   print_operator: 'printing',
   pressing_operator: 'pressing',
@@ -197,13 +139,24 @@ function requireAuth(req, res, next) {
   next();
 }
 
+function hasAdminAccess(user) {
+  return user.role === 'admin' || user.role === 'supervisor';
+}
+
 function allowRoles(...roles) {
   return (req, res, next) => {
-    if (req.user.role === 'admin' || roles.includes(req.user.role)) {
+    if (hasAdminAccess(req.user) || roles.includes(req.user.role)) {
       return next();
     }
     return res.status(403).json({ error: 'You do not have permission for this action' });
   };
+}
+
+function allowOrderCrud(req, res, next) {
+  if (req.user.role === 'supervisor' && req.user.business_unit === 'sublimation') {
+    return res.status(403).json({ error: 'Sublimation supervisors have read-only access to orders' });
+  }
+  next();
 }
 
 function hashPassword(password) {
@@ -285,7 +238,10 @@ function fetchOrder(orderId) {
 
 function canAccessOrder(user, order, options = {}) {
   if (!order) return false;
-  if (user.role === 'admin') return true;
+  if (user.role === 'supervisor') {
+    return order.business_unit === user.business_unit;
+  }
+  if (hasAdminAccess(user)) return true;
   if (user.role === 'sales') {
     return order.sales_rep_id === user.id;
   }
@@ -302,17 +258,22 @@ function canAccessOrder(user, order, options = {}) {
 }
 
 function publicOrder(order, user) {
+  const client = db.prepare(
+    `SELECT company_name, contact_person, contact_number, shipping_address
+     FROM clients WHERE client_id = ?`,
+  ).get(order.client_id);
   const safeOrder = {
     ...order,
     layout_fee_paid: Number(order.layout_fee) >= PAID_LAYOUT_FEE_THRESHOLD ? 1 : 0,
     sales_rep_name: db
       .prepare('SELECT name FROM users WHERE id = ?')
       .get(order.sales_rep_id)?.name ?? '',
-    client_company_name: db
-      .prepare('SELECT company_name FROM clients WHERE client_id = ?')
-      .get(order.client_id)?.company_name ?? '',
+    client_company_name: client?.company_name ?? '',
+    client_contact_person: client?.contact_person ?? '',
+    client_contact_number: client?.contact_number ?? '',
+    client_shipping_address: client?.shipping_address ?? '',
   };
-  if (!['admin', 'sales'].includes(user.role)) {
+  if (!hasAdminAccess(user) && user.role !== 'sales') {
     delete safeOrder.layout_fee;
     delete safeOrder.layout_fee_paid;
     delete safeOrder.down_payment;
@@ -334,14 +295,11 @@ function getOrderForUser(req, res, options) {
 }
 
 function recordOrderEvent(orderId, actorId, eventType, fromStage, toStage, details = '') {
-  const event = db.prepare(
+  db.prepare(
     `INSERT INTO order_events
       (order_id, actor_id, event_type, from_stage, to_stage, details)
      VALUES (?, ?, ?, ?, ?, ?)`,
   ).run(orderId, actorId, eventType, fromStage, toStage, details);
-  if (fromStage !== toStage) {
-    notifyOrderStage(orderId, toStage, event.lastInsertRowid);
-  }
 }
 
 function handoffOrderToPressing(orderId, actorId, eventType, details) {
@@ -354,138 +312,8 @@ function handoffOrderToPressing(orderId, actorId, eventType, details) {
   recordOrderEvent(orderId, actorId, eventType, order.order_status, 'pressing', details);
 }
 
-function sendBrowserPush(userIds, notification) {
-  const recipients = [...new Set(userIds.filter((id) => Number.isInteger(id)))];
-  if (recipients.length === 0) return;
-  const placeholders = recipients.map(() => '?').join(', ');
-  const subscriptions = db.prepare(
-    `SELECT id, endpoint, p256dh, auth FROM push_subscriptions
-     WHERE user_id IN (${placeholders})`,
-  ).all(...recipients);
-  const payload = JSON.stringify(notification);
-  for (const subscription of subscriptions) {
-    webPush.sendNotification({
-      endpoint: subscription.endpoint,
-      keys: { p256dh: subscription.p256dh, auth: subscription.auth },
-    }, payload).catch((error) => {
-      if (error.statusCode === 404 || error.statusCode === 410) {
-        db.prepare('DELETE FROM push_subscriptions WHERE id = ?').run(subscription.id);
-        return;
-      }
-      console.error(`Browser notification delivery failed for subscription ${subscription.id}:`, error);
-    });
-  }
-}
-
-function notifyWorkspaceChange(userIds, title, body, tag) {
-  sendBrowserPush(userIds, {
-    title,
-    body,
-    tag: `${tag}-${Date.now()}`,
-    url: '/',
-  });
-}
-
-function getUserIdsForRoles(roles) {
-  if (roles.length === 0) return [];
-  return db
-    .prepare(`SELECT id FROM users WHERE role IN (${roles.map(() => '?').join(', ')})`)
-    .all(...roles)
-    .map(({ id }) => id);
-}
-
-function notifyClientChange(client, action) {
-  const admins = getUserIdsForRoles(['admin']);
-  notifyWorkspaceChange(
-    [...admins, client.sales_rep_id],
-    `Client ${action}`,
-    `Client ${client.company_name} was ${action}.`,
-    `client-${client.client_id}-${action}`,
-  );
-}
-
-function notifyOrderChange(order, action) {
-  const admins = getUserIdsForRoles(['admin']);
-  const roleByStage = {
-    printing: 'print_operator',
-    pressing: 'pressing_operator',
-    cutting: 'cutting_operator',
-    sewing: 'sewing_operator',
-    packing: 'packing_operator',
-  };
-  const stageRole = roleByStage[order.order_status];
-  const stageUsers = stageRole
-    ? getUserIdsForRoles([stageRole]).concat(
-      db.prepare('SELECT id FROM users WHERE assigned_station = ?').all(order.order_status).map(({ id }) => id),
-    )
-    : [];
-  const reprintUsers = action.includes('reprint')
-    ? getUserIdsForRoles(['print_operator'])
-    : [];
-  notifyWorkspaceChange(
-    [...admins, order.sales_rep_id, order.assigned_artist_id, ...stageUsers, ...reprintUsers],
-    `Order ${action}`,
-    `Order ${order.order_id} (${order.team_project_name}) was ${action}.`,
-    `order-${order.order_id}-${action}`,
-  );
-}
-
-function notifySettingsChange(description, tag) {
-  notifyWorkspaceChange(
-    getUserIdsForRoles(['admin', 'sales']),
-    'Order settings updated',
-    description,
-    `settings-${tag}`,
-  );
-}
-
-function notifyStaffChange(staffId, action, name) {
-  notifyWorkspaceChange(
-    [...getUserIdsForRoles(['admin']), staffId],
-    `Staff ${action}`,
-    `Staff account ${name} was ${action}.`,
-    `staff-${staffId}-${action}`,
-  );
-}
-
-function notifyOrderStage(orderId, stage, eventId) {
-  const order = fetchOrder(orderId);
-  if (!order) return;
-  const admins = db.prepare("SELECT id FROM users WHERE role = 'admin'").all().map(({ id }) => id);
-  let assignedRecipients = [];
-  if (stage === 'mockup' || stage === 'sizing') {
-    assignedRecipients = order.assigned_artist_id
-      ? [order.assigned_artist_id]
-      : [order.sales_rep_id];
-  } else if (stage === 'sales_approval' || stage === 'complete' || stage === 'pickup_delivered') {
-    assignedRecipients = [order.sales_rep_id];
-  } else {
-    const roleByStage = {
-      printing: 'print_operator',
-      pressing: 'pressing_operator',
-      cutting: 'cutting_operator',
-      sewing: 'sewing_operator',
-      packing: 'packing_operator',
-    };
-    const role = roleByStage[stage];
-    if (role) {
-      assignedRecipients = db.prepare(
-        'SELECT id FROM users WHERE role = ? OR assigned_station = ?',
-      ).all(role, stage).map(({ id }) => id);
-    }
-  }
-  sendBrowserPush([...admins, ...assignedRecipients], {
-    title: stage === 'complete' || stage === 'pickup_delivered'
-      ? `Order ${orderId} completed`
-      : `Order ${orderId} advanced`,
-    body: `${order.team_project_name} is now in ${notificationStageLabels[stage] || stage}.`,
-    tag: `order-${orderId}-event-${eventId}`,
-    url: '/',
-  });
-}
-
 function canManageLineup(user, order) {
-  if (user.role === 'admin') return true;
+  if (hasAdminAccess(user)) return true;
   if (user.role === 'sales') return order.sales_rep_id === user.id;
   return user.role === 'artist' &&
     order.assigned_artist_id === user.id &&
@@ -544,12 +372,16 @@ function calculateLineupQuantity(headers, rows) {
 
 function validateFabricInventoryEntry(body) {
   const fabric = typeof body?.fabric === 'string' ? body.fabric.trim() : '';
+  const fabricWidth = typeof body?.fabric_width === 'string' ? body.fabric_width.trim() : '';
   const gsm = Number(body?.gsm);
   const rollQuantity = Number(body?.roll_quantity);
   const measurementType = body?.measurement_type;
   const entryDate = body?.entry_date;
   if (!fabric || fabric.length > 100) {
     return { error: 'Fabric name is required and must be 100 characters or fewer' };
+  }
+  if (!fabricWidth || fabricWidth.length > 50) {
+    return { error: 'Fabric width is required and must be 50 characters or fewer' };
   }
   if (!Number.isSafeInteger(gsm) || gsm <= 0) {
     return { error: 'GSM must be a positive whole number' };
@@ -581,6 +413,7 @@ function validateFabricInventoryEntry(body) {
     return {
       value: {
         fabric,
+        fabric_width: fabricWidth,
         gsm,
         roll_quantity: rollQuantity,
         measurement_type: measurementType,
@@ -608,6 +441,7 @@ function validateFabricInventoryEntry(body) {
   return {
     value: {
       fabric,
+      fabric_width: fabricWidth,
       gsm,
       roll_quantity: rollQuantity,
       measurement_type: measurementType,
@@ -729,61 +563,6 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'Backend is running' });
 });
 
-app.get('/api/notifications/public-key', requireAuth, (req, res) => {
-  res.json({ publicKey: vapidKeys.publicKey });
-});
-
-app.post('/api/notifications/subscribe', requireAuth, (req, res) => {
-  const { endpoint, keys } = req.body ?? {};
-  let parsedEndpoint;
-  try {
-    parsedEndpoint = new URL(endpoint);
-  } catch {
-    return res.status(400).json({ error: 'Provide a valid browser push endpoint' });
-  }
-  const allowedPushHosts = [
-    'fcm.googleapis.com',
-    'push.services.mozilla.com',
-    'push.apple.com',
-    'notify.windows.com',
-  ];
-  const allowedHost = allowedPushHosts.some((host) =>
-    parsedEndpoint.hostname === host || parsedEndpoint.hostname.endsWith(`.${host}`),
-  );
-  if (
-    parsedEndpoint.protocol !== 'https:' ||
-    parsedEndpoint.username ||
-    parsedEndpoint.password ||
-    !allowedHost ||
-    typeof keys?.p256dh !== 'string' ||
-    typeof keys?.auth !== 'string' ||
-    !keys.p256dh ||
-    !keys.auth
-  ) {
-    return res.status(400).json({ error: 'The browser push subscription is invalid or unsupported' });
-  }
-  db.prepare(
-    `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(endpoint) DO UPDATE SET
-       user_id = excluded.user_id,
-       p256dh = excluded.p256dh,
-       auth = excluded.auth,
-       updated_at = CURRENT_TIMESTAMP`,
-  ).run(req.user.id, parsedEndpoint.toString(), keys.p256dh, keys.auth);
-  res.status(204).end();
-});
-
-app.delete('/api/notifications/subscribe', requireAuth, (req, res) => {
-  const { endpoint } = req.body ?? {};
-  if (typeof endpoint !== 'string' || !endpoint) {
-    return res.status(400).json({ error: 'Provide the browser push endpoint to remove' });
-  }
-  db.prepare('DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?')
-    .run(req.user.id, endpoint);
-  res.status(204).end();
-});
-
 app.get('/api/staff', requireAuth, allowRoles('admin'), (req, res) => {
   const staff = db
     .prepare(
@@ -804,13 +583,170 @@ app.get('/api/artists', requireAuth, allowRoles('sales'), (req, res) => {
 app.get(
   '/api/settings/machines',
   requireAuth,
-  allowRoles('sales', 'print_operator', 'pressing_operator', 'cutting_operator'),
+  allowRoles('sales', 'supervisor', 'print_operator', 'pressing_operator', 'cutting_operator'),
   (req, res) => {
     const station = roleStations[req.user.role];
     const machines = station
-      ? db.prepare('SELECT id, category, name FROM machines WHERE category = ? ORDER BY name').all(station)
-      : db.prepare('SELECT id, category, name FROM machines ORDER BY category, name').all();
+      ? db.prepare('SELECT id, category, name, business_unit FROM machines WHERE category = ? ORDER BY name').all(station)
+      : db.prepare('SELECT id, category, name, business_unit FROM machines ORDER BY category, business_unit, name').all();
   res.json({ machines });
+  },
+);
+
+function getDatabaseFilename(value) {
+  const requestedName = String(value ?? '').trim();
+  const baseName = requestedName.toLocaleLowerCase().endsWith('.db')
+    ? requestedName.slice(0, -3)
+    : requestedName;
+  if (
+    !baseName ||
+    baseName.length > 80 ||
+    !/^[A-Za-z0-9][A-Za-z0-9 _-]*$/.test(baseName) ||
+    path.basename(requestedName) !== requestedName
+  ) {
+    return null;
+  }
+  return `${baseName}.db`;
+}
+
+app.get('/api/settings/database/export', requireAuth, allowRoles('admin'), async (req, res) => {
+  const filename = getDatabaseFilename(req.query.file_name);
+  if (!filename) return res.status(400).json({ error: 'Enter a valid database filename' });
+  const exportPath = path.join(path.dirname(dbPath), `${uuidv4()}-${filename}`);
+  try {
+    await db.backup(exportPath);
+  } catch (error) {
+    fs.rmSync(exportPath, { force: true });
+    console.error('Unable to export the database:', error);
+    return res.status(500).json({ error: 'Unable to export the database' });
+  }
+  res.download(exportPath, filename, (error) => {
+    fs.rmSync(exportPath, { force: true });
+    if (error && !res.headersSent) {
+      res.status(500).json({ error: 'Unable to deliver the database export' });
+    }
+  });
+});
+
+app.post(
+  '/api/settings/database/import',
+  requireAuth,
+  allowRoles('admin'),
+  databaseUpload.single('database'),
+  (req, res) => {
+    const filename = getDatabaseFilename(req.body?.file_name);
+    if (!filename) return res.status(400).json({ error: 'Enter a valid database filename' });
+    if (!req.file || path.extname(req.file.originalname).toLocaleLowerCase() !== '.db') {
+      return res.status(400).json({ error: 'Select a SQLite .db database file' });
+    }
+    const mode = req.body?.mode;
+    if (!['replace', 'merge'].includes(mode)) {
+      return res.status(400).json({ error: 'Select Replace or Merge import mode' });
+    }
+
+    const temporaryPath = path.join(path.dirname(dbPath), `${uuidv4()}-import.db`);
+    let importedDb;
+    let attached = false;
+    try {
+      fs.writeFileSync(temporaryPath, req.file.buffer, { flag: 'wx' });
+      importedDb = new Database(temporaryPath, { readonly: true, fileMustExist: true });
+      const integrity = importedDb.pragma('integrity_check');
+      if (integrity.length !== 1 || integrity[0].integrity_check !== 'ok') {
+        return res.status(400).json({ error: 'The selected file is not a valid SQLite database' });
+      }
+      const importedTables = importedDb
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .all()
+        .map((row) => row.name);
+      const currentTables = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .all()
+        .map((row) => row.name);
+      if (importedTables.length !== currentTables.length ||
+        importedTables.some((table, index) => table !== currentTables[index])) {
+        return res.status(400).json({
+          error: 'The database schema does not match this BPSMS version',
+        });
+      }
+      for (const table of currentTables) {
+        const quote = (identifier) => `"${identifier.replaceAll('"', '""')}"`;
+        const currentColumns = db.prepare(`PRAGMA table_info(${quote(table)})`).all().map((column) => column.name);
+        const incomingColumns = importedDb.prepare(`PRAGMA table_info(${quote(table)})`).all().map((column) => column.name);
+        if (currentColumns.length !== incomingColumns.length ||
+          currentColumns.some((column, index) => column !== incomingColumns[index])) {
+          return res.status(400).json({ error: `The ${table} table is incompatible with this BPSMS version` });
+        }
+      }
+      if (!importedDb.prepare("SELECT 1 FROM users WHERE is_protected = 1 AND role = 'admin' LIMIT 1").get()) {
+        return res.status(400).json({ error: 'The database does not contain a protected administrator account' });
+      }
+
+      const protectedUserTriggers = db.prepare(
+        `SELECT sql FROM sqlite_master
+         WHERE type = 'trigger'
+           AND name IN ('prevent_protected_user_update', 'prevent_protected_user_delete')
+         ORDER BY name`,
+      ).all().map((trigger) => trigger.sql).filter(Boolean);
+      db.prepare('ATTACH DATABASE ? AS bpsms_import').run(temporaryPath);
+      attached = true;
+      const quote = (identifier) => `"${identifier.replaceAll('"', '""')}"`;
+      db.pragma('foreign_keys = OFF');
+      try {
+        const importRows = db.transaction(() => {
+          const dataTables = currentTables.filter((table) => table !== 'sessions');
+          db.exec(
+            'DROP TRIGGER IF EXISTS prevent_protected_user_update; DROP TRIGGER IF EXISTS prevent_protected_user_delete;',
+          );
+          if (mode === 'replace') {
+            db.prepare('DELETE FROM sessions').run();
+            for (const table of [...dataTables].reverse()) {
+              db.exec(`DELETE FROM main.${quote(table)}`);
+            }
+          }
+          for (const table of dataTables) {
+            db.exec(
+              `INSERT OR REPLACE INTO main.${quote(table)}
+               SELECT * FROM bpsms_import.${quote(table)}`,
+            );
+          }
+          const violations = db.prepare('PRAGMA main.foreign_key_check').all();
+          if (violations.length) {
+            throw new Error('The imported data would violate database relationships');
+          }
+          if (!db.prepare("SELECT 1 FROM main.users WHERE is_protected = 1 AND role = 'admin' LIMIT 1").get()) {
+            throw new Error('The import must preserve a protected administrator account');
+          }
+          for (const trigger of protectedUserTriggers) db.exec(trigger);
+        });
+        importRows();
+      } finally {
+        db.pragma('foreign_keys = ON');
+      }
+      db.prepare('DETACH DATABASE bpsms_import').run();
+      attached = false;
+      res.json({
+        message: mode === 'replace'
+          ? `Database ${filename} restored. Sign in again to continue.`
+          : `Database ${filename} merged successfully.`,
+        mode,
+      });
+    } catch (error) {
+      console.error('Unable to import the database:', error);
+      if (error.message === 'The imported data would violate database relationships') {
+        return res.status(409).json({ error: error.message });
+      }
+      return res.status(400).json({ error: 'Unable to import this database file' });
+    } finally {
+      if (attached) {
+        try {
+          db.prepare('DETACH DATABASE bpsms_import').run();
+        } catch (error) {
+          console.error('Unable to detach the imported database:', error);
+        }
+      }
+      if (importedDb?.open) importedDb.close();
+      fs.rmSync(temporaryPath, { force: true });
+    }
   },
 );
 
@@ -839,7 +775,6 @@ app.post('/api/settings/style-number-options', requireAuth, allowRoles('admin'),
     const option = db
       .prepare('SELECT id, category, name, code FROM style_number_options WHERE id = ?')
       .get(result.lastInsertRowid);
-    notifySettingsChange(`Product style option ${option.name} was created.`, `style-option-${option.id}-created`);
     res.status(201).json({ option });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
@@ -861,25 +796,25 @@ app.delete('/api/settings/style-number-options/:id', requireAuth, allowRoles('ad
     return res.status(409).json({ error: 'This option is used by an order and cannot be deleted' });
   }
   db.prepare('DELETE FROM style_number_options WHERE id = ?').run(optionId);
-  notifySettingsChange(`Product style option ${option.name} was deleted.`, `style-option-${optionId}-deleted`);
   res.status(204).end();
 });
 
 app.post('/api/settings/machines', requireAuth, allowRoles('admin'), (req, res) => {
   const { category, name } = req.body ?? {};
+  const businessUnit = category === 'printing' ? req.body?.business_unit ?? null : null;
   if (
     !Object.hasOwn(machineOrderFields, category) ||
     typeof name !== 'string' ||
-    !name.trim()
+    !name.trim() ||
+    (category === 'printing' && businessUnit !== null && !['dtf', 'sublimation'].includes(businessUnit))
   ) {
-    return res.status(400).json({ error: 'Select a valid machine category and provide a name' });
+    return res.status(400).json({ error: 'Select a valid machine category and provide a name and printer section' });
   }
   try {
     const result = db
-      .prepare('INSERT INTO machines (category, name) VALUES (?, ?)')
-      .run(category, name.trim());
-    const machine = db.prepare('SELECT id, category, name FROM machines WHERE id = ?').get(result.lastInsertRowid);
-    notifySettingsChange(`${machine.category} machine ${machine.name} was created.`, `machine-${machine.id}-created`);
+      .prepare('INSERT INTO machines (category, name, business_unit) VALUES (?, ?, ?)')
+      .run(category, name.trim(), businessUnit);
+    const machine = db.prepare('SELECT id, category, name, business_unit FROM machines WHERE id = ?').get(result.lastInsertRowid);
     res.status(201).json({ machine });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
@@ -892,23 +827,26 @@ app.post('/api/settings/machines', requireAuth, allowRoles('admin'), (req, res) 
 app.put('/api/settings/machines/:id', requireAuth, allowRoles('admin'), (req, res) => {
   const machineId = Number(req.params.id);
   const { name } = req.body ?? {};
-  if (!Number.isInteger(machineId) || typeof name !== 'string' || !name.trim()) {
-    return res.status(400).json({ error: 'Provide a valid machine ID and name' });
+  const machine = Number.isInteger(machineId)
+    ? db.prepare('SELECT * FROM machines WHERE id = ?').get(machineId)
+    : null;
+  const businessUnit = machine?.category === 'printing'
+    ? req.body?.business_unit ?? machine.business_unit
+    : null;
+  if (!Number.isInteger(machineId) || typeof name !== 'string' || !name.trim() ||
+    (machine?.category === 'printing' && businessUnit !== null && !['dtf', 'sublimation'].includes(businessUnit))) {
+    return res.status(400).json({ error: 'Provide a valid machine ID, name, and printer section' });
   }
-  const machine = db.prepare('SELECT * FROM machines WHERE id = ?').get(machineId);
   if (!machine) return res.status(404).json({ error: 'Machine not found' });
   const field = machineOrderFields[machine.category];
   if (db.prepare(`SELECT 1 FROM orders WHERE ${field} = ? LIMIT 1`).get(machine.name)) {
     return res.status(409).json({ error: 'This machine is assigned to an order and cannot be renamed' });
   }
   try {
-    db.prepare('UPDATE machines SET name = ? WHERE id = ?').run(name.trim(), machineId);
-    notifySettingsChange(
-      `${machine.category} machine ${machine.name} was renamed to ${name.trim()}.`,
-      `machine-${machineId}-updated`,
-    );
+    db.prepare('UPDATE machines SET name = ?, business_unit = ? WHERE id = ?')
+      .run(name.trim(), businessUnit, machineId);
     res.json({
-      machine: db.prepare('SELECT id, category, name FROM machines WHERE id = ?').get(machineId),
+      machine: db.prepare('SELECT id, category, name, business_unit FROM machines WHERE id = ?').get(machineId),
     });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
@@ -930,7 +868,6 @@ app.delete('/api/settings/machines/:id', requireAuth, allowRoles('admin'), (req,
     return res.status(409).json({ error: 'This machine is assigned to an order and cannot be deleted' });
   }
   db.prepare('DELETE FROM machines WHERE id = ?').run(machineId);
-  notifySettingsChange(`${machine.category} machine ${machine.name} was deleted.`, `machine-${machineId}-deleted`);
   res.status(204).end();
 });
 
@@ -991,7 +928,6 @@ app.post('/api/staff', requireAuth, allowRoles('admin'), (req, res) => {
          FROM users WHERE id = ?`,
       )
       .get(result.lastInsertRowid);
-    notifyStaffChange(staff.id, 'created', staff.name);
     res.status(201).json({ staff });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
@@ -1088,7 +1024,6 @@ app.put('/api/staff/:id', requireAuth, allowRoles('admin'), (req, res) => {
          FROM users WHERE id = ?`,
       )
       .get(staffId);
-    notifyStaffChange(staff.id, 'updated', staff.name);
     res.json({ staff });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
@@ -1117,7 +1052,6 @@ app.delete('/api/staff/:id', requireAuth, allowRoles('admin'), (req, res) => {
 
   try {
     db.prepare('DELETE FROM users WHERE id = ?').run(staffId);
-    notifyStaffChange(staffId, 'deleted', staff.name);
     res.status(204).end();
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
@@ -1129,9 +1063,9 @@ app.delete('/api/staff/:id', requireAuth, allowRoles('admin'), (req, res) => {
   }
 });
 
-app.get('/api/clients', requireAuth, allowRoles('sales'), (req, res) => {
+app.get('/api/clients', requireAuth, allowRoles('sales', 'supervisor'), (req, res) => {
   const query =
-    req.user.role === 'admin'
+    hasAdminAccess(req.user)
       ? `SELECT clients.*, users.name AS sales_rep_name
          FROM clients JOIN users ON users.id = clients.sales_rep_id
          ORDER BY clients.company_name`
@@ -1139,7 +1073,7 @@ app.get('/api/clients', requireAuth, allowRoles('sales'), (req, res) => {
          FROM clients JOIN users ON users.id = clients.sales_rep_id
          WHERE clients.sales_rep_id = ? ORDER BY clients.company_name`;
   const clients =
-    req.user.role === 'admin'
+    hasAdminAccess(req.user)
       ? db.prepare(query).all()
       : db.prepare(query).all(req.user.id);
   res.json({ clients });
@@ -1156,7 +1090,7 @@ app.post('/api/clients', requireAuth, allowRoles('sales'), (req, res) => {
     return res.status(400).json({ error: 'All client profile fields are required' });
   }
 
-  const salesRepId = req.user.role === 'admin'
+  const salesRepId = hasAdminAccess(req.user)
     ? Number(req.body?.sales_rep_id)
     : req.user.id;
   const salesRep = db
@@ -1181,7 +1115,6 @@ app.post('/api/clients', requireAuth, allowRoles('sales'), (req, res) => {
       salesRepId,
     );
     const client = db.prepare('SELECT * FROM clients WHERE client_id = ?').get(clientId);
-    notifyClientChange(client, 'created');
     res.status(201).json({ client });
   } catch (error) {
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
@@ -1209,7 +1142,7 @@ app.put('/api/clients/:clientId', requireAuth, allowRoles('sales'), (req, res) =
     return res.status(404).json({ error: 'Client not found' });
   }
 
-  const salesRepId = req.user.role === 'admin'
+  const salesRepId = hasAdminAccess(req.user)
     ? Number(req.body?.sales_rep_id)
     : client.sales_rep_id;
   const salesRep = db
@@ -1232,11 +1165,6 @@ app.put('/api/clients/:clientId', requireAuth, allowRoles('sales'), (req, res) =
       salesRepId,
       client.client_id,
     );
-    notifyClientChange({
-      ...client,
-      company_name: company_name.trim(),
-      sales_rep_id: salesRepId,
-    }, 'updated');
     res.json({
       client: db.prepare('SELECT * FROM clients WHERE client_id = ?').get(client.client_id),
     });
@@ -1265,20 +1193,32 @@ app.delete('/api/clients/:clientId', requireAuth, allowRoles('sales'), (req, res
   }
 
   db.prepare('DELETE FROM clients WHERE client_id = ?').run(client.client_id);
-  notifyClientChange(client, 'deleted');
   res.status(204).end();
 });
 
 function canManageFabricInventory(user) {
-  return user.role === 'admin' ||
-    user.role === 'pressing_operator' ||
-    (user.role === 'supervisor' && user.business_unit === 'sublimation');
+  return hasAdminAccess(user) || user.role === 'pressing_operator';
+}
+
+function isOrderFabricAvailable(fabric, fabricWidth, gsm, existingOrder = null) {
+  if (
+    existingOrder &&
+    existingOrder.fabric === fabric &&
+    (existingOrder.fabric_width || '') === fabricWidth &&
+    Number(existingOrder.gsm) === Number(gsm)
+  ) {
+    return true;
+  }
+  return Boolean(db.prepare(
+    `SELECT 1 FROM fabric_inventory
+     WHERE fabric = ? COLLATE NOCASE
+       AND fabric_width = ? COLLATE NOCASE
+       AND gsm = ?
+     LIMIT 1`,
+  ).get(fabric, fabricWidth, Number(gsm)));
 }
 
 app.get('/api/fabric-inventory', requireAuth, allowRoles('pressing_operator', 'supervisor'), (req, res) => {
-  if (req.user.role === 'supervisor' && req.user.business_unit !== 'sublimation') {
-    return res.status(403).json({ error: 'Fabric inventory is available to B-POWER Supervisors only' });
-  }
   const filters = [];
   const params = [];
   if (typeof req.query.date === 'string' && req.query.date) {
@@ -1302,6 +1242,15 @@ app.get('/api/fabric-inventory', requireAuth, allowRoles('pressing_operator', 's
   res.json({ entries });
 });
 
+app.get('/api/fabric-inventory/options', requireAuth, (req, res) => {
+  const options = db.prepare(
+    `SELECT DISTINCT fabric, fabric_width, gsm
+     FROM fabric_inventory
+     ORDER BY fabric COLLATE NOCASE, fabric_width COLLATE NOCASE, gsm`,
+  ).all();
+  res.json({ options });
+});
+
 app.post('/api/fabric-inventory', requireAuth, (req, res, next) => {
   if (!canManageFabricInventory(req.user)) {
     return res.status(403).json({ error: 'You do not have permission to manage fabric inventory' });
@@ -1313,10 +1262,10 @@ app.post('/api/fabric-inventory', requireAuth, (req, res, next) => {
   const entry = result.value;
   const insert = db.prepare(
     `INSERT INTO fabric_inventory (
-       fabric, gsm, roll_quantity, measurement_type, meters_per_roll,
+       fabric, fabric_width, gsm, roll_quantity, measurement_type, meters_per_roll,
        kilo_per_meter, kilo_per_roll, total_meter, entry_date, created_by, updated_by
      ) VALUES (
-       @fabric, @gsm, @roll_quantity, @measurement_type, @meters_per_roll,
+       @fabric, @fabric_width, @gsm, @roll_quantity, @measurement_type, @meters_per_roll,
        @kilo_per_meter, @kilo_per_roll, @total_meter, @entry_date, @user_id, @user_id
      )`,
   ).run({ ...entry, user_id: req.user.id });
@@ -1340,7 +1289,7 @@ app.put('/api/fabric-inventory/:id', requireAuth, (req, res, next) => {
   if (result.error) return res.status(400).json({ error: result.error });
   db.prepare(
     `UPDATE fabric_inventory SET
-       fabric = @fabric, gsm = @gsm, roll_quantity = @roll_quantity,
+       fabric = @fabric, fabric_width = @fabric_width, gsm = @gsm, roll_quantity = @roll_quantity,
        measurement_type = @measurement_type, meters_per_roll = @meters_per_roll,
        kilo_per_meter = @kilo_per_meter, kilo_per_roll = @kilo_per_roll,
        total_meter = @total_meter, entry_date = @entry_date,
@@ -1351,11 +1300,28 @@ app.put('/api/fabric-inventory/:id', requireAuth, (req, res, next) => {
   res.json({ entry: saved });
 });
 
-app.get('/api/consumables', requireAuth, allowRoles('supervisor'), (req, res) => {
+app.delete('/api/fabric-inventory/:id', requireAuth, (req, res, next) => {
+  if (!canManageFabricInventory(req.user)) {
+    return res.status(403).json({ error: 'You do not have permission to manage fabric inventory' });
+  }
+  next();
+}, (req, res) => {
+  const entryId = Number(req.params.id);
+  if (!Number.isInteger(entryId) || entryId <= 0) {
+    return res.status(400).json({ error: 'Fabric entry ID is invalid' });
+  }
+  const result = db.prepare('DELETE FROM fabric_inventory WHERE id = ?').run(entryId);
+  if (result.changes === 0) return res.status(404).json({ error: 'Fabric entry not found' });
+  res.status(204).end();
+});
+
+app.get('/api/consumables', requireAuth, allowRoles('supervisor', 'print_operator'), (req, res) => {
   const requestedUnit = req.query.business_unit;
-  const businessUnits = req.user.role === 'admin'
+  const businessUnits = hasAdminAccess(req.user)
     ? (['dtf', 'sublimation'].includes(requestedUnit) ? [requestedUnit] : ['dtf', 'sublimation'])
-    : [req.user.business_unit];
+    : req.user.role === 'print_operator'
+      ? ['sublimation']
+      : [];
   if (businessUnits.some((unit) => !['dtf', 'sublimation'].includes(unit))) {
     return res.status(403).json({ error: 'Supervisor business unit is not configured' });
   }
@@ -1423,9 +1389,6 @@ app.post('/api/consumables/transactions', requireAuth, allowRoles('supervisor'),
   ) {
     return res.status(400).json({ error: 'Enter a valid consumable transaction date' });
   }
-  if (req.user.role === 'supervisor' && req.user.business_unit !== businessUnit) {
-    return res.status(403).json({ error: 'You can only manage consumables for your assigned business unit' });
-  }
   if (type === 'adjustment' && !note) {
     return res.status(400).json({ error: 'Enter a reason for the stock adjustment' });
   }
@@ -1455,9 +1418,118 @@ app.post('/api/consumables/transactions', requireAuth, allowRoles('supervisor'),
   res.status(201).json({ id: result.id });
 });
 
+function isValidInventoryDate(entryDate) {
+  return typeof entryDate === 'string' &&
+    /^\d{4}-\d{2}-\d{2}$/.test(entryDate) &&
+    !Number.isNaN(new Date(`${entryDate}T00:00:00Z`).getTime()) &&
+    new Date(`${entryDate}T00:00:00Z`).toISOString().slice(0, 10) === entryDate;
+}
+
+function getConsumableTransactionImpact(type, quantity) {
+  return type === 'usage' ? -quantity : quantity;
+}
+
+function getConsumableBalance(businessUnit, consumableCode, excludedId = null) {
+  return db.prepare(
+    `SELECT COALESCE(SUM(CASE
+       WHEN transaction_type = 'stock_in' THEN quantity
+       WHEN transaction_type = 'usage' THEN -quantity
+       ELSE quantity
+     END), 0) AS on_hand
+     FROM consumable_transactions
+     WHERE business_unit = ? AND consumable_code = ?
+       AND (? IS NULL OR id != ?)`,
+  ).get(businessUnit, consumableCode, excludedId, excludedId).on_hand;
+}
+
+function syncPaperUsageForStationLog(transaction) {
+  if (
+    transaction.transaction_type !== 'usage' ||
+    !transaction.station_log_id ||
+    !transaction.consumable_code.startsWith('subli_paper_')
+  ) return;
+  const paperMeters = db.prepare(
+    `SELECT COALESCE(SUM(quantity), 0) AS paper_meters
+     FROM consumable_transactions
+     WHERE station_log_id = ? AND transaction_type = 'usage'
+       AND consumable_code LIKE 'subli_paper_%'`,
+  ).get(transaction.station_log_id).paper_meters;
+  db.prepare('UPDATE station_logs SET paper_meters = ? WHERE id = ?')
+    .run(paperMeters, transaction.station_log_id);
+}
+
+app.put('/api/consumables/transactions/:id', requireAuth, allowRoles('supervisor'), (req, res) => {
+  const transactionId = Number(req.params.id);
+  if (!Number.isInteger(transactionId) || transactionId <= 0) {
+    return res.status(400).json({ error: 'Consumable transaction ID is invalid' });
+  }
+  const existing = db.prepare('SELECT * FROM consumable_transactions WHERE id = ?').get(transactionId);
+  if (!existing) return res.status(404).json({ error: 'Consumable transaction not found' });
+  const quantity = Number(req.body?.quantity);
+  const entryDate = req.body?.entry_date;
+  const note = typeof req.body?.note === 'string' ? req.body.note.trim() : '';
+  if (
+    !Number.isFinite(quantity) ||
+    (existing.transaction_type !== 'adjustment' && quantity <= 0) ||
+    (existing.transaction_type === 'adjustment' && quantity === 0)
+  ) {
+    return res.status(400).json({ error: 'Enter a valid non-zero transaction quantity' });
+  }
+  if (!isValidInventoryDate(entryDate)) {
+    return res.status(400).json({ error: 'Enter a valid consumable transaction date' });
+  }
+  if (existing.transaction_type === 'adjustment' && !note) {
+    return res.status(400).json({ error: 'Enter a reason for the stock adjustment' });
+  }
+
+  const update = db.transaction(() => {
+    const balanceWithoutEntry = getConsumableBalance(
+      existing.business_unit,
+      existing.consumable_code,
+      transactionId,
+    );
+    const resultingBalance = balanceWithoutEntry +
+      getConsumableTransactionImpact(existing.transaction_type, quantity);
+    if (resultingBalance < -1e-9) {
+      return { error: `This change would make ${consumableCatalog[existing.consumable_code]?.label || existing.consumable_code} stock negative` };
+    }
+    db.prepare(
+      `UPDATE consumable_transactions
+       SET quantity = ?, entry_date = ?, note = ?
+       WHERE id = ?`,
+    ).run(quantity, entryDate, note, transactionId);
+    syncPaperUsageForStationLog(existing);
+    return {};
+  });
+  const result = update();
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json({ id: transactionId });
+});
+
+app.delete('/api/consumables/transactions/:id', requireAuth, allowRoles('supervisor'), (req, res) => {
+  const transactionId = Number(req.params.id);
+  if (!Number.isInteger(transactionId) || transactionId <= 0) {
+    return res.status(400).json({ error: 'Consumable transaction ID is invalid' });
+  }
+  const existing = db.prepare('SELECT * FROM consumable_transactions WHERE id = ?').get(transactionId);
+  if (!existing) return res.status(404).json({ error: 'Consumable transaction not found' });
+  const remove = db.transaction(() => {
+    const resultingBalance = getConsumableBalance(existing.business_unit, existing.consumable_code, transactionId);
+    if (resultingBalance < -1e-9) {
+      return { error: `This transaction cannot be deleted because it would make ${consumableCatalog[existing.consumable_code]?.label || existing.consumable_code} stock negative` };
+    }
+    db.prepare('DELETE FROM consumable_transactions WHERE id = ?').run(transactionId);
+    syncPaperUsageForStationLog(existing);
+    return {};
+  });
+  const result = remove();
+  if (result.error) return res.status(409).json({ error: result.error });
+  res.status(204).end();
+});
+
 app.get('/api/orders', requireAuth, (req, res) => {
   let orders;
-  if (req.user.role === 'admin') {
+  if (hasAdminAccess(req.user)) {
     orders = db.prepare('SELECT * FROM orders ORDER BY created_at DESC').all();
   } else if (req.user.role === 'sales') {
     orders = db
@@ -1499,7 +1571,7 @@ app.get('/api/orders', requireAuth, (req, res) => {
     ? db
         .prepare(
           `SELECT station_logs.id, station_logs.order_id, station_logs.station,
-                  station_logs.fabric_used, station_logs.paper_meters,
+                  station_logs.fabric_used, station_logs.printer_brand, station_logs.paper_meters,
                   station_logs.defect_description, station_logs.reprint_job_id,
                   station_logs.created_at, users.name AS operator
            FROM station_logs
@@ -1514,6 +1586,28 @@ app.get('/api/orders', requireAuth, (req, res) => {
     const logs = logsByOrder.get(log.order_id) || [];
     logs.push(log);
     logsByOrder.set(log.order_id, logs);
+  }
+  const productionItems = orders.length
+    ? db
+        .prepare(
+          `SELECT production_log_items.*, station_logs.order_id
+           FROM production_log_items
+           JOIN station_logs ON station_logs.id = production_log_items.station_log_id
+           WHERE station_logs.order_id IN (${orders.map(() => '?').join(', ')})
+           ORDER BY production_log_items.id`,
+        )
+        .all(...orders.map((order) => order.order_id))
+    : [];
+  const itemsByLog = new Map();
+  for (const item of productionItems) {
+    const items = itemsByLog.get(item.station_log_id) || [];
+    items.push(item);
+    itemsByLog.set(item.station_log_id, items);
+  }
+  for (const logs of logsByOrder.values()) {
+    for (const log of logs) {
+      log.production_items = itemsByLog.get(log.id) || [];
+    }
   }
   const pressingNotes = orders.length
     ? db
@@ -1547,7 +1641,160 @@ app.get('/api/orders', requireAuth, (req, res) => {
   });
 });
 
-app.post('/api/orders', requireAuth, allowRoles('sales'), (req, res) => {
+app.get('/api/order-priorities', requireAuth, (req, res) => {
+  const activeOrders = "order_status NOT IN ('complete', 'pickup_delivered')";
+  let where;
+  let params = [];
+  if (hasAdminAccess(req.user)) {
+    where = activeOrders;
+  } else if (req.user.role === 'sales') {
+    where = `${activeOrders} AND sales_rep_id = ?`;
+    params = [req.user.id];
+  } else if (req.user.role === 'artist') {
+    where = `${activeOrders} AND assigned_artist_id = ? AND layout_fee >= ?`;
+    params = [req.user.id, PAID_LAYOUT_FEE_THRESHOLD];
+  } else if (roleStations[req.user.role]) {
+    where = `${activeOrders} AND order_status = ?`;
+    params = [roleStations[req.user.role]];
+  } else {
+    return res.json({ orders: [] });
+  }
+  const orders = db.prepare(
+    `SELECT order_id, team_project_name, order_status, due_date, order_priority, print_mode
+     FROM orders
+     WHERE ${where}
+     ORDER BY CASE order_priority
+       WHEN 'Urgent' THEN 0
+       WHEN 'High' THEN 1
+       ELSE 2
+     END, due_date, order_id`,
+  ).all(...params);
+  res.json({ orders });
+});
+
+app.put('/api/orders/:orderId/priority', requireAuth, allowRoles('admin', 'sales', 'supervisor'), (req, res) => {
+  const order = fetchOrder(req.params.orderId);
+  if (
+    !order ||
+    (req.user.role === 'sales' && order.sales_rep_id !== req.user.id)
+  ) {
+    return res.status(404).json({ error: 'Order not found' });
+  }
+  if (['complete', 'pickup_delivered'].includes(order.order_status)) {
+    return res.status(409).json({ error: 'Completed orders cannot have their priority changed' });
+  }
+  const priority = req.body?.order_priority;
+  if (!orderPriorities.includes(priority)) {
+    return res.status(400).json({ error: `Select one of: ${orderPriorities.join(', ')}` });
+  }
+  if (order.order_priority !== priority) {
+    db.prepare(
+      'UPDATE orders SET order_priority = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ?',
+    ).run(priority, order.order_id);
+    recordOrderEvent(
+      order.order_id,
+      req.user.id,
+      'priority_changed',
+      order.order_status,
+      order.order_status,
+      `Priority changed from ${order.order_priority} to ${priority}`,
+    );
+  }
+  res.json({ order: fetchOrder(order.order_id) });
+});
+
+app.post('/api/orders', requireAuth, allowRoles('sales', 'supervisor', 'admin'), allowOrderCrud, (req, res) => {
+  const isDirectPrintingOrder = hasAdminAccess(req.user) && req.body?.direct_print === true;
+  if (isDirectPrintingOrder) {
+    const businessUnit = req.body?.business_unit;
+    if (!['dtf', 'sublimation'].includes(businessUnit)) {
+      return res.status(400).json({ error: 'Select DTF or Sublimation for this print order' });
+    }
+    const {
+      client_id: clientId,
+      team_project_name: projectName,
+      due_date: dueDate,
+      print_mode: printMode,
+      printer_machine: printerMachine,
+      pressing_machine: pressingMachine,
+    } = req.body ?? {};
+    if (![clientId, projectName, dueDate, printMode, printerMachine].every(
+      (value) => typeof value === 'string' && value.trim(),
+    )) {
+      return res.status(400).json({
+        error: 'Client, name, date, print mode, and printer brand are required',
+      });
+    }
+    if (!['print_only', 'print_press'].includes(printMode)) {
+      return res.status(400).json({ error: 'Select Print only or Print and press' });
+    }
+    if (printMode === 'print_press' &&
+      (typeof pressingMachine !== 'string' || !pressingMachine.trim())) {
+      return res.status(400).json({
+        error: 'Select a configured pressing machine for Print and press orders',
+      });
+    }
+    const parsedDueDate = /^\d{4}-\d{2}-\d{2}$/.test(dueDate)
+      ? new Date(`${dueDate}T00:00:00Z`)
+      : null;
+    if (
+      !parsedDueDate ||
+      Number.isNaN(parsedDueDate.getTime()) ||
+      parsedDueDate.toISOString().slice(0, 10) !== dueDate
+    ) {
+      return res.status(400).json({ error: 'Due date must be a valid YYYY-MM-DD date' });
+    }
+    const quantity = Number(req.body?.total_quantity);
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      return res.status(400).json({ error: 'Order quantity must be a positive whole number' });
+    }
+    const client = db.prepare('SELECT * FROM clients WHERE client_id = ?').get(clientId);
+    if (!client) return res.status(404).json({ error: 'Client not found' });
+    if (!db.prepare(
+      "SELECT 1 FROM machines WHERE category = 'printing' AND name = ? AND (business_unit IS NULL OR business_unit = ?)",
+    ).get(printerMachine, businessUnit)) {
+      return res.status(400).json({ error: 'Select a configured printer brand for this order type' });
+    }
+    if (
+      printMode === 'print_press' &&
+      !db.prepare("SELECT 1 FROM machines WHERE category = 'pressing' AND name = ?").get(pressingMachine)
+    ) {
+      return res.status(400).json({ error: 'Select a configured pressing machine' });
+    }
+    const orderId = createId('ORD', 'orders', 'order_id');
+    db.prepare(
+      `INSERT INTO orders (
+        order_id, client_id, sales_rep_id, team_project_name, due_date,
+        style_number, category, style, cut, neck, sleeve_type, sleeve_length,
+        fabric, gsm, item, total_quantity, business_unit, print_mode,
+        printer_machine, pressing_machine, order_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PRINT', 'N/A', 'N/A',
+        'N/A', 'N/A', 'N/A', 1, ?, ?, ?, ?, ?, ?, 'printing')`,
+    ).run(
+      orderId,
+      clientId,
+      client.sales_rep_id,
+      projectName.trim(),
+      dueDate,
+      businessUnit === 'dtf' ? 'DTF-ORDER' : 'SUBLI-ORDER',
+      businessUnit === 'dtf' ? 'DTF' : 'Sublimation',
+      `${businessUnit === 'dtf' ? 'DTF' : 'Sublimation'} ${printMode === 'print_only' ? 'print only' : 'print and press'}`,
+      quantity,
+      businessUnit,
+      printMode,
+      printerMachine,
+      printMode === 'print_press' ? pressingMachine : null,
+    );
+    recordOrderEvent(
+      orderId,
+      req.user.id,
+      'created',
+      null,
+      'printing',
+      `${req.user.role === 'supervisor' ? 'Supervisor' : 'Admin'} order · ${businessUnit} · ${printMode}`,
+    );
+    return res.status(201).json({ order: fetchOrder(orderId) });
+  }
   const productStyle = req.body?.style_option_ids
     ? resolveProductStyle(req.body.style_option_ids, req.body)
     : null;
@@ -1557,6 +1804,7 @@ app.post('/api/orders', requireAuth, allowRoles('sales'), (req, res) => {
     'team_project_name',
     'due_date',
     'fabric',
+    'fabric_width',
     'gsm',
   ];
   if (!productStyle) {
@@ -1621,6 +1869,16 @@ app.post('/api/orders', requireAuth, allowRoles('sales'), (req, res) => {
   if (!Number.isInteger(Number(req.body.gsm)) || Number(req.body.gsm) <= 0) {
     return res.status(400).json({ error: 'GSM must be a positive whole number' });
   }
+  if (
+    String(req.body.fabric_width).trim().length > 50 ||
+    !isOrderFabricAvailable(
+      String(req.body.fabric).trim(),
+      String(req.body.fabric_width).trim(),
+      req.body.gsm,
+    )
+  ) {
+    return res.status(400).json({ error: 'Select a fabric, width, and GSM combination from Fabric inventory' });
+  }
 
   const artistId = layoutFeePaid && assigned_artist_id ? Number(assigned_artist_id) : null;
   if (layoutFeePaid) {
@@ -1653,7 +1911,7 @@ app.post('/api/orders', requireAuth, allowRoles('sales'), (req, res) => {
   const salesRepId =
     req.user.role === 'sales'
       ? req.user.id
-      : Number(req.body.sales_rep_id || req.user.id);
+      : Number(req.body.sales_rep_id || (hasAdminAccess(req.user) ? client.sales_rep_id : req.user.id));
   if (salesRepId !== req.user.id) {
     const salesRep = db
       .prepare("SELECT id FROM users WHERE id = ? AND role = 'sales'")
@@ -1667,14 +1925,14 @@ app.post('/api/orders', requireAuth, allowRoles('sales'), (req, res) => {
   db.prepare(
     `INSERT INTO orders (
       order_id, client_id, sales_rep_id, team_project_name, due_date, style_number,
-      category, style, cut, neck, sleeve_type, sleeve_length, fabric, gsm, item,
+      category, style, cut, neck, sleeve_type, sleeve_length, fabric, fabric_width, gsm, item,
       other_details, layout_fee, layout_fee_paid, per_piece_price, down_payment, assigned_artist_id, printer_machine,
-      pressing_machine, cutting_machine
+      pressing_machine, cutting_machine, business_unit, print_mode
     ) VALUES (
       @order_id, @client_id, @sales_rep_id, @team_project_name, @due_date, @style_number,
-      @category, @style, @cut, @neck, @sleeve_type, @sleeve_length, @fabric, @gsm, @item,
+      @category, @style, @cut, @neck, @sleeve_type, @sleeve_length, @fabric, @fabric_width, @gsm, @item,
       @other_details, @layout_fee, @layout_fee_paid, @per_piece_price, @down_payment, @assigned_artist_id,
-      @printer_machine, @pressing_machine, @cutting_machine
+      @printer_machine, @pressing_machine, @cutting_machine, 'sublimation', 'print_press'
     )`,
   ).run({
     order_id: orderId,
@@ -1690,6 +1948,7 @@ app.post('/api/orders', requireAuth, allowRoles('sales'), (req, res) => {
     sleeve_type: productStyle?.values.sleeve_type ?? req.body.sleeve_type,
     sleeve_length: productStyle?.values.sleeve_length ?? req.body.sleeve_length,
     fabric: String(req.body.fabric).trim(),
+    fabric_width: String(req.body.fabric_width).trim(),
     gsm: Number(req.body.gsm),
     item: deriveItem(
       productStyle?.values.category ?? req.body.category,
@@ -1709,7 +1968,7 @@ app.post('/api/orders', requireAuth, allowRoles('sales'), (req, res) => {
   res.status(201).json({ order: fetchOrder(orderId) });
 });
 
-app.put('/api/orders/:orderId', requireAuth, allowRoles('sales'), (req, res) => {
+app.put('/api/orders/:orderId', requireAuth, allowRoles('sales'), allowOrderCrud, (req, res) => {
   const order = fetchOrder(req.params.orderId);
   if (!order || (req.user.role === 'sales' && order.sales_rep_id !== req.user.id)) {
     return res.status(404).json({ error: 'Order not found' });
@@ -1724,6 +1983,7 @@ app.put('/api/orders/:orderId', requireAuth, allowRoles('sales'), (req, res) => 
     'team_project_name',
     'due_date',
     'fabric',
+    'fabric_width',
     'gsm',
   ];
   if (!productStyle) {
@@ -1735,7 +1995,7 @@ app.put('/api/orders/:orderId', requireAuth, allowRoles('sales'), (req, res) => 
     }
   }
 
-  const salesRepId = req.user.role === 'admin'
+  const salesRepId = hasAdminAccess(req.user)
     ? Number(req.body.sales_rep_id || order.sales_rep_id)
     : order.sales_rep_id;
   const salesRep = db
@@ -1780,6 +2040,17 @@ app.put('/api/orders/:orderId', requireAuth, allowRoles('sales'), (req, res) => 
   const layoutFeePaid = layoutFee >= PAID_LAYOUT_FEE_THRESHOLD ? 1 : 0;
   if (!Number.isInteger(gsm) || gsm <= 0) {
     return res.status(400).json({ error: 'GSM must be a positive whole number' });
+  }
+  if (
+    String(req.body.fabric_width).trim().length > 50 ||
+    !isOrderFabricAvailable(
+      String(req.body.fabric).trim(),
+      String(req.body.fabric_width).trim(),
+      gsm,
+      order,
+    )
+  ) {
+    return res.status(400).json({ error: 'Select a fabric, width, and GSM combination from Fabric inventory' });
   }
   if (
     !Number.isFinite(layoutFee) ||
@@ -1844,7 +2115,7 @@ app.put('/api/orders/:orderId', requireAuth, allowRoles('sales'), (req, res) => 
     `UPDATE orders SET
       client_id = ?, sales_rep_id = ?, team_project_name = ?, due_date = ?, style_number = ?,
       category = ?, style = ?, cut = ?, neck = ?, sleeve_type = ?, sleeve_length = ?,
-      fabric = ?, gsm = ?, item = ?, other_details = ?, layout_fee = ?, layout_fee_paid = ?, per_piece_price = ?, down_payment = ?,
+      fabric = ?, fabric_width = ?, gsm = ?, item = ?, other_details = ?, layout_fee = ?, layout_fee_paid = ?, per_piece_price = ?, down_payment = ?,
       assigned_artist_id = ?, printer_machine = ?, pressing_machine = ?, cutting_machine = ?,
       updated_at = CURRENT_TIMESTAMP
      WHERE order_id = ?`,
@@ -1861,6 +2132,7 @@ app.put('/api/orders/:orderId', requireAuth, allowRoles('sales'), (req, res) => 
     productStyle?.values.sleeve_type ?? req.body.sleeve_type,
     productStyle?.values.sleeve_length ?? req.body.sleeve_length,
     String(req.body.fabric).trim(),
+    String(req.body.fabric_width).trim(),
     gsm,
     deriveItem(
       productStyle?.values.category ?? req.body.category,
@@ -1884,11 +2156,10 @@ app.put('/api/orders/:orderId', requireAuth, allowRoles('sales'), (req, res) => 
     order.order_status,
     order.order_status,
   );
-  notifyOrderChange(fetchOrder(order.order_id), 'updated');
   res.json({ order: fetchOrder(order.order_id) });
 });
 
-app.put('/api/orders/:orderId/payments', requireAuth, allowRoles('sales'), (req, res) => {
+app.put('/api/orders/:orderId/payments', requireAuth, allowRoles('sales'), allowOrderCrud, (req, res) => {
   const order = fetchOrder(req.params.orderId);
   if (!order || (req.user.role === 'sales' && order.sales_rep_id !== req.user.id)) {
     return res.status(404).json({ error: 'Order not found' });
@@ -1913,11 +2184,10 @@ app.put('/api/orders/:orderId/payments', requireAuth, allowRoles('sales'), (req,
        updated_at = CURRENT_TIMESTAMP
      WHERE order_id = ?`,
   ).run(layoutFee, downPayment, order.order_id);
-  notifyOrderChange(order, 'payment details updated');
   res.json({ order: fetchOrder(order.order_id) });
 });
 
-app.delete('/api/orders/:orderId', requireAuth, allowRoles('sales'), (req, res) => {
+app.delete('/api/orders/:orderId', requireAuth, allowRoles('sales'), allowOrderCrud, (req, res) => {
   const order = fetchOrder(req.params.orderId);
   if (!order || (req.user.role === 'sales' && order.sales_rep_id !== req.user.id)) {
     return res.status(404).json({ error: 'Order not found' });
@@ -1944,7 +2214,6 @@ app.delete('/api/orders/:orderId', requireAuth, allowRoles('sales'), (req, res) 
       fs.rmSync(path.join(uploadDir, filename), { force: true });
     }
   }
-  notifyOrderChange(order, 'deleted');
   res.status(204).end();
 });
 
@@ -2026,7 +2295,6 @@ app.post('/api/orders/:orderId/lineup', requireAuth, allowRoles('sales', 'artist
   if (order.spreadsheet_path) {
     fs.rmSync(path.join(uploadDir, order.spreadsheet_path), { force: true });
   }
-  notifyOrderChange(order, 'lineup updated');
   res.json({ total_quantity: lineup.totalQuantity, order: fetchOrder(order.order_id) });
 });
 
@@ -2078,7 +2346,6 @@ app.put('/api/orders/:orderId/lineup', requireAuth, allowRoles('sales', 'artist'
     return res.status(500).json({ error: 'Unable to save the edited lineup spreadsheet' });
   }
   if (filepath) fs.rmSync(filepath, { force: true });
-  notifyOrderChange(order, 'lineup edited');
   res.json({ ...table, filename, extension: ext, order: fetchOrder(order.order_id) });
 });
 
@@ -2104,19 +2371,17 @@ app.post(
     return res.status(400).json({ error: 'Mock-up file must be PNG, JPG, JPEG, or PDF' });
   }
   const mockupFilename = saveUpload(mockup);
-  let testPrintRequest;
   try {
-    testPrintRequest = db.transaction(() => {
+    db.transaction(() => {
       db.prepare(
         `UPDATE orders
          SET mockup_path = ?, order_status = 'sales_approval',
              updated_at = CURRENT_TIMESTAMP
          WHERE order_id = ?`,
       ).run(mockupFilename, order.order_id);
-      const request = db.prepare(
+      db.prepare(
         'INSERT INTO test_print_requests (order_id, artist_id, mockup_path) VALUES (?, ?, ?)',
       ).run(order.order_id, req.user.id, mockupFilename);
-      return db.prepare('SELECT * FROM test_print_requests WHERE id = ?').get(request.lastInsertRowid);
     })();
   } catch (error) {
     fs.rmSync(path.join(uploadDir, mockupFilename), { force: true });
@@ -2130,15 +2395,6 @@ app.post(
     fs.rmSync(path.join(uploadDir, order.mockup_path), { force: true });
   }
   recordOrderEvent(order.order_id, req.user.id, 'mockup_uploaded', 'mockup', 'sales_approval');
-  const printingRecipients = getUserIdsForRoles(['admin', 'print_operator']).concat(
-    db.prepare("SELECT id FROM users WHERE assigned_station = 'printing'").all().map(({ id }) => id),
-  );
-  sendBrowserPush(printingRecipients, {
-    title: 'Test print requested',
-    body: `A test print is requested for ${order.order_id} (${order.team_project_name}).`,
-    tag: `test-print-${testPrintRequest.id}`,
-    url: '/',
-  });
   res.json({ order: fetchOrder(order.order_id) });
   },
 );
@@ -2161,7 +2417,6 @@ app.post('/api/orders/:orderId/swatch', requireAuth, allowRoles('sales'), upload
   if (order.swatch_path && path.basename(order.swatch_path) === order.swatch_path) {
     fs.rmSync(path.join(uploadDir, order.swatch_path), { force: true });
   }
-  notifyOrderChange(order, 'swatch updated');
   res.json({ order: fetchOrder(order.order_id) });
 });
 
@@ -2174,11 +2429,19 @@ app.get('/api/orders/:orderId/files/:kind', requireAuth, (req, res) => {
       ? order.swatch_path
     : req.params.kind === 'lineup'
       ? order.spreadsheet_path
+    : req.params.kind === 'production-spreadsheet'
+      ? order.production_spreadsheet_path
       : null;
   if (!file || path.basename(file) !== file) {
     return res.status(404).json({ error: 'File not found' });
   }
-  res.sendFile(path.join(uploadDir, file), (error) => {
+  const filePath = path.join(uploadDir, file);
+  if (req.params.kind === 'production-spreadsheet') {
+    return res.download(filePath, `production-${order.order_id}.xlsx`, (error) => {
+      if (error && !res.headersSent) res.status(error.statusCode || 404).end();
+    });
+  }
+  res.sendFile(filePath, (error) => {
     if (error && !res.headersSent) res.status(error.statusCode || 404).end();
   });
 });
@@ -2278,7 +2541,7 @@ app.post('/api/orders/:orderId/complete-sizing', requireAuth, allowRoles('artist
 });
 
 function verifyStationAssignment(user, station) {
-  return user.role === 'admin' || roleStations[user.role] === station;
+  return hasAdminAccess(user) || roleStations[user.role] === station;
 }
 
 app.post('/api/orders/:orderId/station-log', requireAuth, (req, res) => {
@@ -2290,7 +2553,20 @@ app.post('/api/orders/:orderId/station-log', requireAuth, (req, res) => {
   }
 
   const legacyPaperMeters = Number(req.body?.paper_meters || 0);
-  const fabricUsed = String(req.body?.fabric_used || '').trim();
+  const fabricUsed = order.business_unit === 'dtf' || order.print_mode === 'print_only'
+    ? ''
+    : String(req.body?.fabric_used || '').trim();
+  const printerBrand = station === 'printing'
+    ? String(req.body?.printer_brand || order.printer_machine || '').trim()
+    : '';
+  if (
+    station === 'printing' &&
+    !db.prepare(
+      "SELECT 1 FROM machines WHERE category = 'printing' AND name = ? AND (business_unit IS NULL OR business_unit = ?)",
+    ).get(printerBrand, order.business_unit || 'sublimation')
+  ) {
+    return res.status(400).json({ error: 'Select a configured printer brand' });
+  }
   const defect = String(req.body?.defect_description || '').trim();
   if (!Number.isFinite(legacyPaperMeters) || legacyPaperMeters < 0) {
     return res.status(400).json({ error: 'Paper usage must be a non-negative number of meters' });
@@ -2342,10 +2618,10 @@ app.post('/api/orders/:orderId/station-log', requireAuth, (req, res) => {
     const result = db
       .prepare(
         `INSERT INTO station_logs
-          (order_id, station, operator_id, fabric_used, paper_meters, defect_description)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+          (order_id, station, operator_id, fabric_used, printer_brand, paper_meters, defect_description)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(order.order_id, station, req.user.id, fabricUsed, paperMeters, defect || null);
+      .run(order.order_id, station, req.user.id, fabricUsed, printerBrand, paperMeters, defect || null);
     const stationLogId = result.lastInsertRowid;
     for (const entry of consumables) {
       db.prepare(
@@ -2360,6 +2636,17 @@ app.post('/api/orders/:orderId/station-log', requireAuth, (req, res) => {
         order.order_id,
         stationLogId,
         req.user.id,
+      );
+      db.prepare(
+        `INSERT INTO production_log_items
+           (station_log_id, consumable_code, label, quantity, unit)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(
+        stationLogId,
+        entry.code,
+        entry.product.label,
+        entry.code.includes('_ink_') ? entry.quantity * 1000 : entry.quantity,
+        entry.code.includes('_ink_') ? 'ml' : entry.product.unit,
       );
     }
     let reprint = null;
@@ -2388,7 +2675,6 @@ app.post('/api/orders/:orderId/station-log', requireAuth, (req, res) => {
   });
   const result = log();
   if (result.error) return res.status(400).json({ error: result.error });
-  notifyOrderChange(order, defect ? 'production issue logged' : 'production log added');
   res.status(201).json(result);
 });
 
@@ -2397,13 +2683,13 @@ app.post('/api/orders/:orderId/reprint-log', requireAuth, upload.single('image')
   if (!order) return;
   const stageCanRequest =
     ['pressing', 'cutting', 'sewing', 'packing'].includes(order.order_status) &&
-    (req.user.role === 'admin' || roleStations[req.user.role] === order.order_status);
+    (hasAdminAccess(req.user) || roleStations[req.user.role] === order.order_status);
   const lateRequestCanRequest =
-    ['admin', 'print_operator'].includes(req.user.role) &&
+    (hasAdminAccess(req.user) || req.user.role === 'print_operator') &&
     stageSequence.indexOf(order.order_status) >= stageSequence.indexOf('printing');
   const completedOrderCanRequest =
     order.order_status === 'complete' &&
-    ['admin', 'sales', 'artist'].includes(req.user.role);
+    (hasAdminAccess(req.user) || ['sales', 'artist'].includes(req.user.role));
   if (!stageCanRequest && !lateRequestCanRequest && !completedOrderCanRequest) {
     return res.status(403).json({ error: 'Only the assigned production station or Printing can request a reprint' });
   }
@@ -2419,10 +2705,12 @@ app.post('/api/orders/:orderId/reprint-log', requireAuth, upload.single('image')
     return res.status(409).json({ error: 'The order must reach Printing before a reprint can be logged' });
   }
 
-  const fabricUsed = String(req.body?.fabric_used || '').trim();
+  const fabricUsed = order.business_unit === 'dtf' || order.print_mode === 'print_only'
+    ? ''
+    : String(req.body?.fabric_used || '').trim();
   const defect = String(req.body?.defect_description || '').trim();
-  if (!fabricUsed || !defect) {
-    return res.status(400).json({ error: 'Enter the fabric and reason for the reprint' });
+  if ((!fabricUsed && order.business_unit !== 'dtf' && order.print_mode !== 'print_only') || !defect) {
+    return res.status(400).json({ error: 'Enter the fabric when applicable and the reason for the reprint' });
   }
   const imageTypes = new Map([
     ['.png', 'image/png'],
@@ -2458,7 +2746,6 @@ app.post('/api/orders/:orderId/reprint-log', requireAuth, upload.single('image')
         order.order_status,
         defect,
       );
-      notifyOrderChange(order, 'reprint requested');
       return {
         log: db.prepare('SELECT * FROM station_logs WHERE id = ?').get(logResult.lastInsertRowid),
         reprint: db.prepare('SELECT * FROM reprint_jobs WHERE id = ?').get(jobResult.lastInsertRowid),
@@ -2471,7 +2758,7 @@ app.post('/api/orders/:orderId/reprint-log', requireAuth, upload.single('image')
   }
 });
 
-app.post('/api/orders/:orderId/complete-stage', requireAuth, (req, res) => {
+app.post('/api/orders/:orderId/complete-stage', requireAuth, async (req, res) => {
   const order = getOrderForUser(req, res);
   if (!order) return;
   const station = order.order_status;
@@ -2488,11 +2775,15 @@ app.post('/api/orders/:orderId/complete-stage', requireAuth, (req, res) => {
   const nextStage = station === 'pressing' &&
     completedPrintHandoff?.event_type === 'test_print_completed'
     ? 'sales_approval'
-    : stageNext[station];
+    : station === 'printing' && order.print_mode === 'print_only'
+      ? 'complete'
+      : stageNext[station];
   if (!nextStage || !verifyStationAssignment(req.user, station)) {
     return res.status(403).json({ error: 'Only the assigned station can complete this stage' });
   }
-  const pressingNote = station === 'printing'
+  const pressingNote = station === 'printing' &&
+    order.business_unit !== 'dtf' &&
+    order.print_mode !== 'print_only'
     ? String(req.body?.pressing_note || '').trim()
     : '';
   if (pressingNote.length > 1000) {
@@ -2507,17 +2798,114 @@ app.post('/api/orders/:orderId/complete-stage', requireAuth, (req, res) => {
     }
   }
 
-  db.prepare(
-    'UPDATE orders SET order_status = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ?',
-  ).run(nextStage, order.order_id);
-  recordOrderEvent(
-    order.order_id,
-    req.user.id,
-    'stage_completed',
-    station,
-    nextStage,
-    pressingNote,
-  );
+  let productionSpreadsheetPath = null;
+  const previousSpreadsheetPath = order.production_spreadsheet_path;
+  try {
+    if (station === 'printing') {
+      const logs = db.prepare(
+        `SELECT station_logs.id, station_logs.station, station_logs.fabric_used,
+                station_logs.printer_brand,
+                station_logs.paper_meters, station_logs.defect_description,
+                station_logs.created_at, users.name AS operator
+         FROM station_logs
+         JOIN users ON users.id = station_logs.operator_id
+         WHERE station_logs.order_id = ? AND station_logs.station = 'printing'
+         ORDER BY station_logs.id`,
+      ).all(order.order_id);
+      const itemRows = db.prepare(
+        `SELECT production_log_items.station_log_id, production_log_items.label,
+                production_log_items.quantity, production_log_items.unit
+         FROM production_log_items
+         JOIN station_logs ON station_logs.id = production_log_items.station_log_id
+         WHERE station_logs.order_id = ? AND station_logs.station = 'printing'
+         ORDER BY production_log_items.id`,
+      ).all(order.order_id);
+      const itemsByLog = new Map();
+      for (const item of itemRows) {
+        const items = itemsByLog.get(item.station_log_id) || [];
+        items.push(item);
+        itemsByLog.set(item.station_log_id, items);
+      }
+      const workbook = new ExcelJS.Workbook();
+      workbook.creator = 'BPSMS';
+      workbook.subject = `Printing production log for ${order.order_id}`;
+      const worksheet = workbook.addWorksheet('Printing Production');
+      worksheet.addRow([
+        'Order ID', 'Client', 'Project', 'Business unit', 'Print mode',
+        'Recorded at', 'Operator', 'Printer brand', 'Input', 'Quantity', 'Unit',
+        'Fabric used', 'Paper (m)', 'Defect / issue',
+      ]);
+      const clientName = db.prepare('SELECT company_name FROM clients WHERE client_id = ?')
+        .get(order.client_id)?.company_name || '';
+      for (const log of logs) {
+        const logItems = itemsByLog.get(log.id) || [];
+        const rows = logItems.length ? logItems : [{ label: '', quantity: '', unit: '' }];
+        for (const item of rows) {
+          worksheet.addRow([
+            order.order_id,
+            clientName,
+            order.team_project_name,
+            order.business_unit,
+            order.print_mode,
+            log.created_at,
+            log.operator,
+            log.printer_brand,
+            item.label,
+            item.quantity,
+            item.unit,
+            log.fabric_used,
+            log.paper_meters,
+            log.defect_description || '',
+          ]);
+        }
+      }
+      worksheet.getRow(1).font = { bold: true };
+      worksheet.views = [{ state: 'frozen', ySplit: 1 }];
+      worksheet.columns.forEach((column) => {
+        column.width = Math.min(
+          Math.max(...column.values.map((value) => String(value ?? '').length), 12) + 2,
+          40,
+        );
+      });
+      productionSpreadsheetPath = `${uuidv4()}.xlsx`;
+      fs.writeFileSync(
+        path.join(uploadDir, productionSpreadsheetPath),
+        await workbook.xlsx.writeBuffer(),
+        { flag: 'wx' },
+      );
+    }
+
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE orders
+         SET order_status = ?,
+             production_spreadsheet_path = COALESCE(?, production_spreadsheet_path),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE order_id = ?`,
+      ).run(nextStage, productionSpreadsheetPath, order.order_id);
+      recordOrderEvent(
+        order.order_id,
+        req.user.id,
+        'stage_completed',
+        station,
+        nextStage,
+        pressingNote,
+      );
+    })();
+  } catch (error) {
+    if (productionSpreadsheetPath) {
+      fs.rmSync(path.join(uploadDir, productionSpreadsheetPath), { force: true });
+    }
+    console.error('Unable to complete production stage:', error);
+    return res.status(500).json({ error: 'Unable to save the production completion data' });
+  }
+  if (
+    productionSpreadsheetPath &&
+    previousSpreadsheetPath &&
+    path.basename(previousSpreadsheetPath) === previousSpreadsheetPath
+  ) {
+    fs.rmSync(path.join(uploadDir, previousSpreadsheetPath), { force: true });
+  }
   res.json({ order: fetchOrder(order.order_id) });
 });
 
@@ -2558,7 +2946,6 @@ app.put('/api/orders/:orderId/packed-quantity', requireAuth, allowRoles('sales')
       `Packed pieces: ${packedQuantity}; per-piece price: ${perPiecePrice.toFixed(2)}; total amount: ${(perPiecePrice * packedQuantity).toFixed(2)}; balance after layout fee and down payment: ${(perPiecePrice * packedQuantity - Number(order.layout_fee || 0) - Number(order.down_payment || 0)).toFixed(2)}`,
     );
   })();
-  notifyOrderChange(fetchOrder(order.order_id), 'packed quantity saved');
   res.json({ order: fetchOrder(order.order_id) });
 });
 
@@ -2642,13 +3029,6 @@ app.post('/api/test-prints/:id/:action', requireAuth, (req, res) => {
         fs.rmSync(path.join(uploadDir, request.mockup_path), { force: true });
       }
     }
-    const recipients = [request.artist_id, ...getUserIdsForRoles(['admin'])];
-    sendBrowserPush(recipients, {
-      title: 'Test print completed',
-      body: `The test print for ${request.order_id} is complete.`,
-      tag: `test-print-${request.id}-complete`,
-      url: '/',
-    });
   }
   res.json({
     job: db.prepare('SELECT * FROM test_print_requests WHERE id = ?').get(request.id),
@@ -2656,14 +3036,16 @@ app.post('/api/test-prints/:id/:action', requireAuth, (req, res) => {
 });
 
 app.get('/api/reprints', requireAuth, (req, res) => {
-  if (!['admin', 'print_operator'].includes(req.user.role)) {
+  if (!hasAdminAccess(req.user) && req.user.role !== 'print_operator') {
     return res.status(403).json({ error: 'Only Printing can access reprint jobs' });
   }
   const reprints = db
     .prepare(
       `SELECT reprint_jobs.*, station_logs.station, station_logs.fabric_used,
               station_logs.defect_description, station_logs.paper_meters,
-              orders.team_project_name, orders.order_status, orders.printer_machine
+             orders.team_project_name, orders.order_status, orders.printer_machine,
+             orders.business_unit, orders.print_mode,
+             orders.business_unit, orders.print_mode
        FROM reprint_jobs
        JOIN station_logs ON station_logs.id = reprint_jobs.station_log_id
        JOIN orders ON orders.order_id = reprint_jobs.order_id
@@ -2723,11 +3105,20 @@ app.post('/api/reprints/:id/station-log', requireAuth, (req, res) => {
   if (reprint.status === 'complete') {
     return res.status(409).json({ error: 'Completed reprint jobs cannot receive production logs' });
   }
-  const fabricUsed = String(req.body?.fabric_used || '').trim();
+  const order = fetchOrder(reprint.order_id);
+  const fabricUsed = order?.business_unit === 'dtf' || order?.print_mode === 'print_only'
+    ? ''
+    : String(req.body?.fabric_used || '').trim();
+  const printerBrand = String(req.body?.printer_brand || order?.printer_machine || '').trim();
   const legacyPaperMeters = Number(req.body?.paper_meters || 0);
   const defect = String(req.body?.defect_description || '').trim();
   if (!Number.isFinite(legacyPaperMeters) || legacyPaperMeters < 0) {
     return res.status(400).json({ error: 'Paper usage must be a non-negative number of meters' });
+  }
+  if (!order || !db.prepare(
+    "SELECT 1 FROM machines WHERE category = 'printing' AND name = ? AND (business_unit IS NULL OR business_unit = ?)",
+  ).get(printerBrand, order.business_unit || 'sublimation')) {
+    return res.status(400).json({ error: 'Select a configured printer brand' });
   }
   const rawConsumables = req.body?.consumables ?? [];
   if (!Array.isArray(rawConsumables) || rawConsumables.length > 7) {
@@ -2777,10 +3168,10 @@ app.post('/api/reprints/:id/station-log', requireAuth, (req, res) => {
     const result = db
       .prepare(
         `INSERT INTO station_logs
-          (order_id, station, operator_id, fabric_used, paper_meters, defect_description, reprint_job_id)
-         VALUES (?, 'printing', ?, ?, ?, ?, ?)`,
+          (order_id, station, operator_id, fabric_used, printer_brand, paper_meters, defect_description, reprint_job_id)
+         VALUES (?, 'printing', ?, ?, ?, ?, ?, ?)`,
       )
-      .run(reprint.order_id, req.user.id, fabricUsed, paperMeters, defect || null, reprint.id);
+      .run(reprint.order_id, req.user.id, fabricUsed, printerBrand, paperMeters, defect || null, reprint.id);
     for (const entry of consumables) {
       db.prepare(
         `INSERT INTO consumable_transactions
@@ -2795,6 +3186,17 @@ app.post('/api/reprints/:id/station-log', requireAuth, (req, res) => {
         result.lastInsertRowid,
         req.user.id,
       );
+      db.prepare(
+        `INSERT INTO production_log_items
+           (station_log_id, consumable_code, label, quantity, unit)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(
+        result.lastInsertRowid,
+        entry.code,
+        entry.product.label,
+        entry.code.includes('_ink_') ? entry.quantity * 1000 : entry.quantity,
+        entry.code.includes('_ink_') ? 'ml' : entry.product.unit,
+      );
     }
     return { logId: result.lastInsertRowid };
   });
@@ -2808,8 +3210,6 @@ app.post('/api/reprints/:id/station-log', requireAuth, (req, res) => {
     'printing',
     defect,
   );
-  const order = fetchOrder(reprint.order_id);
-  notifyOrderChange(order, defect ? 'reprint issue logged' : 'reprint production updated');
   res.status(201).json({
     log: db
       .prepare(
@@ -2827,8 +3227,12 @@ app.post('/api/reprints/:id/:action', requireAuth, (req, res) => {
   }
   const reprint = db.prepare('SELECT * FROM reprint_jobs WHERE id = ?').get(req.params.id);
   if (!reprint) return res.status(404).json({ error: 'Reprint job not found' });
+  const order = fetchOrder(reprint.order_id);
   const action = req.params.action;
-  const pressingNote = String(req.body?.pressing_note || '').trim();
+  const canHandoffToPressing = order?.print_mode !== 'print_only';
+  const pressingNote = canHandoffToPressing && order?.business_unit !== 'dtf'
+    ? String(req.body?.pressing_note || '').trim()
+    : '';
   if (action === 'complete' && pressingNote.length > 1000) {
     return res.status(400).json({ error: 'The note for Pressing must be 1,000 characters or fewer' });
   }
@@ -2843,24 +3247,36 @@ app.post('/api/reprints/:id/:action', requireAuth, (req, res) => {
         `UPDATE reprint_jobs SET status = 'complete', completed_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
       ).run(reprint.id);
-      handoffOrderToPressing(
-        reprint.order_id,
-        req.user.id,
-        'reprint_completed',
-        pressingNote,
-      );
+      if (canHandoffToPressing) {
+        handoffOrderToPressing(
+          reprint.order_id,
+          req.user.id,
+          'reprint_completed',
+          pressingNote,
+        );
+      } else {
+        recordOrderEvent(
+          reprint.order_id,
+          req.user.id,
+          'reprint_completed',
+          order.order_status,
+          order.order_status,
+        );
+      }
     })();
   } else {
     return res.status(409).json({ error: 'This reprint action is not valid for its current status' });
   }
-  const order = fetchOrder(reprint.order_id);
-  notifyOrderChange(order, action === 'start' ? 'reprint started' : 'reprint completed');
   res.json({ reprint: db.prepare('SELECT * FROM reprint_jobs WHERE id = ?').get(reprint.id) });
 });
 
 app.get('/api/reports', requireAuth, allowRoles('sales'), (req, res) => {
-  const salesScope =
-    req.user.role === 'sales' ? 'WHERE sales_rep_id = ?' : '';
+  const salesScope = req.user.role === 'sales'
+    ? 'WHERE sales_rep_id = ?'
+    : '';
+  const joinedOrderScope = req.user.role === 'sales'
+    ? 'WHERE orders.sales_rep_id = ?'
+    : '';
   const params = req.user.role === 'sales' ? [req.user.id] : [];
   const totals = db
     .prepare(
@@ -2887,7 +3303,7 @@ app.get('/api/reports', requireAuth, allowRoles('sales'), (req, res) => {
               SUM(CASE WHEN NULLIF(TRIM(station_logs.defect_description), '') IS NOT NULL THEN 1 ELSE 0 END) AS defects
        FROM station_logs
        JOIN orders ON orders.order_id = station_logs.order_id
-       ${salesScope}`,
+       ${joinedOrderScope}`,
     )
     .get(...params);
   const consumptionByStage = db
@@ -2898,7 +3314,7 @@ app.get('/api/reports', requireAuth, allowRoles('sales'), (req, res) => {
             GROUP_CONCAT(DISTINCT NULLIF(TRIM(station_logs.fabric_used), '')) AS fabric_used
      FROM station_logs
      JOIN orders ON orders.order_id = station_logs.order_id
-     ${salesScope}
+     ${joinedOrderScope}
      GROUP BY station
      ORDER BY station`,
     )
@@ -2931,12 +3347,29 @@ app.get('/api/orders/:orderId/activity', requireAuth, (req, res) => {
   const stationLogs = db
     .prepare(
       `SELECT station_logs.id, station_logs.station, station_logs.fabric_used,
+              station_logs.printer_brand,
               station_logs.paper_meters, station_logs.defect_description,
               station_logs.created_at, users.name AS operator
        FROM station_logs JOIN users ON users.id = station_logs.operator_id
        WHERE station_logs.order_id = ? ORDER BY station_logs.id DESC`,
     )
     .all(order.order_id);
+  const productionItems = db.prepare(
+    `SELECT production_log_items.*
+    FROM production_log_items
+    JOIN station_logs ON station_logs.id = production_log_items.station_log_id
+    WHERE station_logs.order_id = ?
+    ORDER BY production_log_items.id`,
+  ).all(order.order_id);
+  const itemsByLog = new Map();
+  for (const item of productionItems) {
+    const items = itemsByLog.get(item.station_log_id) || [];
+    items.push(item);
+    itemsByLog.set(item.station_log_id, items);
+  }
+  for (const log of stationLogs) {
+    log.production_items = itemsByLog.get(log.id) || [];
+  }
   res.json({ events, station_logs: stationLogs });
 });
 
