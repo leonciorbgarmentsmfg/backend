@@ -12,7 +12,7 @@ import db, { dbPath, verifyAdminCredentials } from './db/init.js';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const HOST = process.env.HOST || (process.env.NODE_ENV === 'production' ? '127.0.0.1' : '0.0.0.0');
+const HOST = process.env.HOST || '0.0.0.0';
 if (process.env.TRUST_PROXY) {
   app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : process.env.TRUST_PROXY);
 }
@@ -22,7 +22,7 @@ const PAID_LAYOUT_FEE_THRESHOLD = 1;
 const MINIMUM_LAYOUT_FEE = 700;
 const orderPriorities = ['Urgent', 'High', 'Normal'];
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const uploadDir = path.join(__dirname, 'uploads');
+const uploadDir = process.env.BPSMS_UPLOAD_DIR || path.join(__dirname, 'uploads');
 const frontendDist = path.resolve(__dirname, '../frontend/dist');
 const upload = multer({
   storage: multer.memoryStorage(),

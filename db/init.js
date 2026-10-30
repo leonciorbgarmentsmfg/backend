@@ -6,7 +6,7 @@ import Database from 'better-sqlite3';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dataDir = path.join(__dirname, '..', 'data');
+const dataDir = process.env.BPSMS_DATA_DIR || path.join(__dirname, '..', 'data');
 const dbPath = path.join(dataDir, 'app.db');
 const ADMIN_USERNAME = 'ADMINISTRATOR';
 const ADMIN_PASSWORD_SALT = 'a1f744672f84784ae3c17225bc6acac0';
